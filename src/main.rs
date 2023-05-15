@@ -75,6 +75,7 @@ fn analyze_model(model: &Model) {
     println!("Genus: {}", (e - v - f) / 2 + 1);
     println!("Connected components: {}", model.connected_components());
     println!("Volume: {}", model.volume());
+    println!("Boundary loops: {}", model.boundary_loops());
 }
 
 fn mat4_by_vec3(mat: Matrix4<f32>, vec: Vector3<f32>) -> Vector3<f32> {
@@ -175,6 +176,7 @@ struct Model {
     pub vertices: Vec<(Vector3<f32>, Vector3<f32>)>,
     pub faces: Vec<Vec<usize>>,
     pub edges: HashSet<[usize; 2]>,
+    pub valences: HashMap<[usize; 2], usize>,
 }
 
 impl Model {
@@ -206,7 +208,7 @@ impl Model {
             .zip(normals.into_iter())
             .map(|(v, n)| (Vector3::new(v.0, v.1, v.2), Vector3::new(n.0, n.1, n.2)))
             .collect();
-        let edges = faces
+        let valences = faces
             .iter()
             .flat_map(|f| {
                 if f.len() >= 2 {
@@ -219,12 +221,17 @@ impl Model {
                     vec![]
                 }
             })
-            .collect();
+            .fold(HashMap::new(), |mut acc, e| {
+                *acc.entry(e).or_insert(0) += 1;
+                acc
+            });
+        let edges = valences.keys().copied().collect();
 
         Self {
             vertices,
             faces,
             edges,
+            valences,
         }
     }
 
@@ -313,5 +320,45 @@ impl Model {
             }
         }
         components
+    }
+
+    pub fn boundary_loops(&self) -> u64 {
+        let mut boundary_vertices: HashSet<_> = self
+            .valences
+            .iter()
+            .filter(|(_, &v)| v == 1)
+            .flat_map(|(e, _)| e)
+            .copied()
+            .collect();
+        let mut neighbors: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for [e1, e2] in self.edges.iter() {
+            if boundary_vertices.contains(e1) && boundary_vertices.contains(e2) {
+                neighbors.entry(*e1).or_default().push(*e2);
+                neighbors.entry(*e2).or_default().push(*e1);
+            }
+        }
+
+        let mut loops = 0;
+
+        while !boundary_vertices.is_empty() {
+            let vertex = *boundary_vertices.iter().next().unwrap();
+
+            let mut stack = vec![vertex];
+
+            while let Some(vertex) = stack.pop() {
+                boundary_vertices.remove(&vertex);
+
+                for neighbor in neighbors.get(&vertex).unwrap_or(&Vec::new()) {
+                    if boundary_vertices.contains(neighbor) {
+                        stack.push(*neighbor);
+                    }
+                }
+            }
+
+            loops += 1;
+        }
+
+        return loops;
     }
 }

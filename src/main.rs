@@ -3,9 +3,10 @@ use std::{
     fs::File,
     io::{BufReader, LineWriter, Write},
     iter,
+    str::FromStr,
 };
 
-use nalgebra::{Matrix3, Matrix4, Vector3, Vector4};
+use nalgebra::{Matrix3, Matrix4, Matrix6, Vector3, Vector4, Vector6};
 use obj::raw::{object::Polygon, parse_obj, RawObj};
 use rand::seq::SliceRandom;
 
@@ -29,6 +30,9 @@ fn main() {
             let k = pargs
                 .value_from_fn("--k", |k| k.parse::<f32>())
                 .unwrap_or(10.0);
+            let distance = pargs
+                .value_from_fn("--distance", |s| Distance::from_str(s))
+                .unwrap_or(Distance::Point2Point);
 
             println!(
                 "from: {from_path}, to: {to_path}, output_path: {output_path}, n: {n}, k: {k}"
@@ -37,7 +41,7 @@ fn main() {
             let from = read_obj(&from_path);
             let to = read_obj(&to_path);
 
-            let output = icp_rigid_registration(&from, &to, n, k);
+            let output = icp_rigid_registration(&from, &to, n, k, distance);
 
             let obj = output.to_obj();
 
@@ -53,6 +57,33 @@ fn main() {
             println!("Unknown subcommand {com:?}");
         }
         None => {}
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Distance {
+    Point2Point,
+    Point2Plane,
+}
+
+impl FromStr for Distance {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "point" => Ok(Self::Point2Point),
+            "plane" => Ok(Self::Point2Plane),
+            _ => panic!("Invalid distance measure"),
+        }
+    }
+}
+
+impl Distance {
+    fn distance(&self, p1: Vector3<f32>, (p2, n): (Vector3<f32>, Vector3<f32>)) -> f32 {
+        match self {
+            Self::Point2Point => p1.metric_distance(&p2),
+            Self::Point2Plane => (p1 - p2).dot(&n).abs(),
+        }
     }
 }
 
@@ -83,7 +114,7 @@ fn mat4_by_vec3(mat: Matrix4<f32>, vec: Vector3<f32>) -> Vector3<f32> {
     Vector3::new(res.x, res.y, res.z)
 }
 
-fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32) -> Model {
+fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32, distance: Distance) -> Model {
     let mut rng = &mut rand::thread_rng();
 
     let mut selected_points = from
@@ -93,6 +124,8 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32) -> Model {
         .collect::<Vec<_>>();
 
     let mut solution = Matrix4::identity();
+    let mut patience_counter = 0;
+    let mut prev_error = std::f32::INFINITY;
 
     for _ in 0..1000 {
         let paired_closest = selected_points
@@ -100,20 +133,32 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32) -> Model {
             .filter_map(|s| {
                 to.vertices
                     .iter()
-                    .map(|v| v.0)
-                    .min_by(|a, b| a.metric_distance(s).total_cmp(&b.metric_distance(s)))
+                    .min_by(|a, b| a.0.metric_distance(&s).total_cmp(&b.0.metric_distance(&s)))
                     .map(|o| (s, o))
             })
             .collect::<Vec<_>>();
 
         let distances = paired_closest
             .iter()
-            .map(|(s, o)| s.metric_distance(&o))
+            .map(|(&s, &o)| distance.distance(s, o))
             .collect::<Vec<_>>();
 
         let error: f32 = distances.iter().sum();
 
         println!("error: {error}");
+
+        // Early stopping
+        if prev_error - error < 1.0 {
+            patience_counter += 1;
+        } else {
+            patience_counter = 0;
+        }
+
+        if patience_counter >= 5 {
+            break;
+        }
+
+        prev_error = error;
 
         let median_distance = distances[distances.len() / 2];
 
@@ -124,12 +169,15 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32) -> Model {
                 if d > k * median_distance {
                     None
                 } else {
-                    Some((*s, o))
+                    Some((*s, *o))
                 }
             })
             .collect();
 
-        let theta = lst_solve(paired_closest);
+        let theta = match distance {
+            Distance::Point2Point => lst_solve(paired_closest),
+            Distance::Point2Plane => lrlst_solve(paired_closest),
+        };
 
         selected_points
             .iter_mut()
@@ -146,13 +194,13 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32) -> Model {
     new
 }
 
-fn lst_solve(pairs: Vec<(Vector3<f32>, Vector3<f32>)>) -> Matrix4<f32> {
+fn lst_solve(pairs: Vec<(Vector3<f32>, (Vector3<f32>, Vector3<f32>))>) -> Matrix4<f32> {
     let from_centroid = pairs.iter().map(|e| e.0).sum::<Vector3<f32>>() / (pairs.len() as f32);
-    let target_centroid = pairs.iter().map(|e| e.1).sum::<Vector3<f32>>() / (pairs.len() as f32);
+    let target_centroid = pairs.iter().map(|e| e.1 .0).sum::<Vector3<f32>>() / (pairs.len() as f32);
 
     let pairs_centroid = pairs
         .into_iter()
-        .map(|(from, target)| (from - from_centroid, target - target_centroid))
+        .map(|(from, target)| (from - from_centroid, target.0 - target_centroid))
         .collect::<Vec<_>>();
 
     let h: Matrix3<f32> = pairs_centroid
@@ -169,6 +217,36 @@ fn lst_solve(pairs: Vec<(Vector3<f32>, Vector3<f32>)>) -> Matrix4<f32> {
         nalgebra_glm::mat3_to_mat4(&x)
     };
     nalgebra_glm::translate(&r, &(target_centroid - x * from_centroid))
+}
+
+fn lrlst_solve(pairs: Vec<(Vector3<f32>, (Vector3<f32>, Vector3<f32>))>) -> Matrix4<f32> {
+    let cross: Vec<_> = pairs
+        .iter()
+        .map(|(p1, (_, n))| (p1.cross(n), n))
+        .map(|(c, n)| Vector6::new(c.x, c.y, c.z, n.x, n.y, n.z))
+        .collect();
+    let dot: Vec<_> = pairs
+        .iter()
+        .map(|(p1, (p2, n))| (*p1 - *p2).dot(n))
+        .collect();
+
+    let a: Matrix6<_> = cross.iter().map(|v| v * v.transpose()).sum();
+    let b: Vector6<_> = cross.iter().zip(dot.iter()).map(|(c, d)| *d * c).sum();
+
+    let rt = a.try_inverse().expect("Unable to invert matrix") * -b;
+    let r = Matrix3::new(1.0, -rt[2], rt[1], rt[2], 1.0, -rt[0], -rt[1], rt[0], 1.0);
+    let t = Vector3::new(rt[3], rt[4], rt[5]);
+
+    let svd = r.svd(true, true);
+    let x = svd.u.unwrap() * svd.v_t.unwrap();
+    let r = if (x.determinant() - 1.0).abs() > 0.00001 {
+        println!("lrlst solve failed with determinant {}", x.determinant());
+        Matrix4::identity()
+    } else {
+        nalgebra_glm::mat3_to_mat4(&x)
+    };
+
+    nalgebra_glm::translate(&r, &t)
 }
 
 #[derive(Clone, Debug)]

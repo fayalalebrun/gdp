@@ -8,7 +8,12 @@ edition = "2021"
 [dependencies]
 lstsq = "0.5"
 nalgebra = "0.32"
-nalgebra-glm = "0.18"
+nalgebra-glm = { version = "0.18", features = ["convert-bytemuck"]}
 obj-rs = { git = "https://github.com/fayalalebrun/obj-rs.git", rev = "066b41e"}
 pico-args = "0.5"
 rand = "0.8"
+
+# visualization-related
+glium = "0.32"
+egui_glium = "0.20.1"
+egui = "0.20"

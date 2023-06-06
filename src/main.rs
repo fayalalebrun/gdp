@@ -6,9 +6,12 @@ use std::{
     str::FromStr,
 };
 
-use nalgebra::{Matrix3, Matrix4, Matrix6, Vector3, Vector4, Vector6};
+use nalgebra::{Matrix3, Matrix4, Matrix6, Point3, Vector3, Vector4, Vector6};
+use nalgebra_glm::{Mat4, Vec2};
 use obj::raw::{object::Polygon, parse_obj, RawObj};
 use rand::seq::SliceRandom;
+
+mod interactive;
 
 fn main() {
     let mut pargs = pico_args::Arguments::from_env();
@@ -52,6 +55,11 @@ fn main() {
                 file.write_all(line.as_bytes()).unwrap();
                 file.write_all(b"\n").unwrap();
             }
+        }
+        Some("gui") => {
+            let model_path = pargs.subcommand().unwrap().expect("Missing model path");
+            let model = read_obj(&model_path);
+            interactive::start(model);
         }
         Some(com) => {
             println!("Unknown subcommand {com:?}");
@@ -127,7 +135,7 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32, distance: 
     let mut patience_counter = 0;
     let mut prev_error = std::f32::INFINITY;
 
-    for _ in 0..1000 {
+    for i in 0..1000 {
         let paired_closest = selected_points
             .iter()
             .filter_map(|s| {
@@ -145,7 +153,7 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32, distance: 
 
         let error: f32 = distances.iter().sum();
 
-        println!("error: {error}");
+        println!("iter: {i} error: {error}");
 
         // Early stopping
         if prev_error - error < 1.0 {
@@ -268,7 +276,7 @@ struct Matrices {
 }
 
 #[derive(Clone, Debug)]
-struct Model {
+pub struct Model {
     pub vertices: Vec<(Vector3<f32>, Vector3<f32>)>,
     pub faces: Vec<Vec<usize>>,
     pub edges: HashSet<[usize; 2]>,
@@ -457,6 +465,31 @@ impl Model {
         }
 
         loops
+    }
+
+    /// Returns a mask with the triangles contained by the rectangle.
+    pub fn triangles_in_rect(&self, mvp: Mat4, bottom_left: Vec2, top_right: Vec2) -> Vec<bool> {
+        self.faces
+            .iter()
+            .map(|t| {
+                let v1 = self.vertices[t[0]].0;
+                let v2 = self.vertices[t[1]].0;
+                let v3 = self.vertices[t[2]].0;
+
+                let center = (v1 + v2 + v3) / 3.0; // Center of triangle
+
+                center
+            })
+            .map(|v| mvp.transform_point(&Point3::from(v)))
+            .map(|v| Vec2::new(v.x, v.y))
+            .map(|v| {
+                if (v - bottom_left).dot(&(v - top_right)) < 0. {
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect()
     }
 
     /// Gradient matrix for a given face/triangle

@@ -249,6 +249,24 @@ fn lrlst_solve(pairs: Vec<(Vector3<f32>, (Vector3<f32>, Vector3<f32>))>) -> Matr
     nalgebra_glm::translate(&r, &t)
 }
 
+/// Cross product of triangle vertices
+/// Used for area and normal vector
+fn triangle_cross(v1: Vector3<f32>, v2: Vector3<f32>, v3: Vector3<f32>) -> Vector3<f32> {
+    (v2 - v1).cross(&(v3 - v1))
+}
+
+#[derive(Debug)]
+struct Matrices {
+    /// Gradient maps for each face
+    pub gradient_maps: Vec<Matrix3<f32>>,
+    /// Cotangent for each vertex pair
+    pub cotangent: HashMap<usize, HashMap<usize, f32>>,
+    /// Neighbors for each vertex, used for combinatorial laplacian
+    pub combinatorial_laplacian: HashMap<usize, Vec<usize>>,
+    /// Geometric laplacian
+    pub geometric_laplacian: HashMap<usize, HashMap<usize, f32>>,
+}
+
 #[derive(Clone, Debug)]
 struct Model {
     pub vertices: Vec<(Vector3<f32>, Vector3<f32>)>,
@@ -342,21 +360,22 @@ impl Model {
     }
 
     pub fn volume(&self) -> f32 {
+        let o = self.vertices[0].0;
         self.faces
             .iter()
             .map(|f| {
                 assert!(f.len() == 3, "Model should be triangulated");
-                let random_origin = self.vertices[0].0;
                 let (v1, _) = self.vertices[f[0]];
                 let (v2, _) = self.vertices[f[1]];
                 let (v3, _) = self.vertices[f[2]];
-                let v1 = v1 - random_origin;
-                let v2 = v2 - random_origin;
-                let v3 = v3 - random_origin;
+                if v1 == o || v2 == o || v3 == o {
+                    return 0.0;
+                }
+                let v1 = v1 - o;
+                let v2 = v2 - o;
+                let v3 = v3 - o;
 
-                let vol = v1.dot(&v2.cross(&v3)).abs() / 6.;
-
-                vol
+                v1.dot(&v2.cross(&v3)).abs() / 6.
             })
             .sum::<f32>()
             .abs()
@@ -391,7 +410,7 @@ impl Model {
                         .iter()
                         .to_owned()
                         .filter(|a| available.contains(a))
-                        .map(|a| *a)
+                        .copied()
                         .collect();
                     queue.append(&mut outgoing);
                 }
@@ -437,6 +456,206 @@ impl Model {
             loops += 1;
         }
 
-        return loops;
+        loops
+    }
+
+    /// Gradient matrix for a given face/triangle
+    /// Multiply this with the outcome of a linear polynomial applied on the vertices of the face
+    fn gradient_map(&self, face: &Vec<usize>) -> Matrix3<f32> {
+        assert!(face.len() == 3, "Model should be triangulated");
+
+        let v = [
+            self.vertices[face[0]].0,
+            self.vertices[face[1]].0,
+            self.vertices[face[2]].0,
+        ];
+        let e = [v[2] - v[1], v[1] - v[0], v[0] - v[2]];
+
+        // This is the triangle normal, which is distinct from the vertex normals
+        let cross = triangle_cross(v[0], v[1], v[2]);
+        let normal = cross.normalize();
+        let half_inv_area = 1.0 / cross.norm();
+
+        half_inv_area
+            * Matrix3::from_columns(&[
+                normal.cross(&e[0]),
+                normal.cross(&e[1]),
+                normal.cross(&e[2]),
+            ])
+    }
+
+    /// Area of each face/triangle
+    fn areas(&self) -> Vec<f32> {
+        self.faces
+            .iter()
+            .map(|f| {
+                0.5 * triangle_cross(
+                    self.vertices[f[0]].0,
+                    self.vertices[f[1]].0,
+                    self.vertices[f[2]].0,
+                )
+                .magnitude()
+            })
+            .collect()
+    }
+
+    /// Collection of faces each vertex belongs to
+    fn vertex_faces(&self) -> HashMap<usize, Vec<usize>> {
+        self.faces
+            .iter()
+            .enumerate()
+            .flat_map(|(i, f)| f.iter().map(|v| (*v, i)).collect::<Vec<_>>())
+            .fold(HashMap::new(), |mut map, (v, f)| {
+                map.entry(v).or_default().push(f);
+                map
+            })
+    }
+
+    /// For each vertex, keep track of the gradient product sum for each neighboring vertex
+    fn cotangent(
+        &self,
+        vertex_faces: &HashMap<usize, Vec<usize>>,
+        gradient_maps: &[Matrix3<f32>],
+        areas: &[f32],
+    ) -> HashMap<usize, HashMap<usize, f32>> {
+        vertex_faces
+            .iter()
+            .map(|(&v, faces)| {
+                (
+                    v,
+                    faces
+                        .iter()
+                        .flat_map(|&f| {
+                            let gradient = gradient_maps[f]
+                                .column(self.faces[f].iter().position(|&o| o == v).unwrap());
+                            (0..faces.len())
+                                .map(|i| {
+                                    (
+                                        self.faces[f][i],
+                                        areas[f] * gradient_maps[f].column(i).dot(&gradient),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .fold(HashMap::new(), |mut map, (v, f)| {
+                            *map.entry(v).or_default() += f;
+                            map
+                        }),
+                )
+            })
+            .collect()
+    }
+
+    /// The neighbor vertices for each vertex
+    /// This can be used for computing the combinatorial laplacian
+    fn neighbors(&self, vertex_faces: &HashMap<usize, Vec<usize>>) -> HashMap<usize, Vec<usize>> {
+        vertex_faces
+            .iter()
+            .map(|(&v, faces)| {
+                (
+                    v,
+                    faces
+                        .iter()
+                        .flat_map(|&f| {
+                            self.faces[f]
+                                .iter()
+                                .filter(|&&o| o != v)
+                                .collect::<Vec<_>>()
+                        })
+                        .copied()
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Combined area of each triangle a vertex belongs to
+    fn vertex_areas(
+        &self,
+        vertex_faces: &HashMap<usize, Vec<usize>>,
+        areas: &[f32],
+    ) -> HashMap<usize, f32> {
+        vertex_faces
+            .iter()
+            .map(|(&v, faces)| (v, faces.iter().map(|&f| areas[f]).sum()))
+            .collect()
+    }
+
+    fn geometric_laplacian(
+        &self,
+        combined_area: &HashMap<usize, f32>,
+        cotangent: &HashMap<usize, HashMap<usize, f32>>,
+    ) -> HashMap<usize, HashMap<usize, f32>> {
+        combined_area
+            .iter()
+            .map(|(v, &a)| (*v, cotangent[v].iter().map(|(&o, &f)| (o, a * f)).collect()))
+            .collect()
+    }
+
+    fn differential_coordinates(&self) -> Matrices {
+        let gradient_maps: Vec<_> = self.faces.iter().map(|f| self.gradient_map(f)).collect();
+        let areas = self.areas();
+        let vertex_faces = self.vertex_faces();
+        let cotangent = self.cotangent(&vertex_faces, &gradient_maps, &areas);
+        let combinatorial_laplacian = self.neighbors(&vertex_faces);
+        let vertex_areas = self.vertex_areas(&vertex_faces, &areas);
+        let geometric_laplacian = self.geometric_laplacian(&vertex_areas, &cotangent);
+
+        Matrices {
+            gradient_maps,
+            cotangent,
+            combinatorial_laplacian,
+            geometric_laplacian,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn triangle_normal_test() {
+        todo!()
+    }
+
+    #[test]
+    fn triangle_area_test() {
+        todo!()
+    }
+
+    #[test]
+    fn gradient_map_test() {
+        todo!()
+    }
+
+    #[test]
+    fn mesh_areas_test() {
+        todo!()
+    }
+
+    #[test]
+    fn mesh_vertex_faces_test() {
+        todo!()
+    }
+
+    #[test]
+    fn mesh_cotangent_test() {
+        todo!()
+    }
+
+    #[test]
+    fn mesh_combinatorial_laplacian_test() {
+        todo!()
+    }
+
+    #[test]
+    fn mesh_vertex_areas_test() {
+        todo!()
+    }
+
+    #[test]
+    fn mesh_geometric_laplacian_test() {
+        todo!()
     }
 }

@@ -141,7 +141,7 @@ fn icp_rigid_registration(from: &Model, to: &Model, n: usize, k: f32, distance: 
             .filter_map(|s| {
                 to.vertices
                     .iter()
-                    .min_by(|a, b| a.0.metric_distance(&s).total_cmp(&b.0.metric_distance(&s)))
+                    .min_by(|a, b| a.0.metric_distance(s).total_cmp(&b.0.metric_distance(s)))
                     .map(|o| (s, o))
             })
             .collect::<Vec<_>>();
@@ -263,6 +263,16 @@ fn triangle_cross(v1: Vector3<f32>, v2: Vector3<f32>, v3: Vector3<f32>) -> Vecto
     (v2 - v1).cross(&(v3 - v1))
 }
 
+/// Normal = normalized(triangle_cross)
+fn normal(v1: Vector3<f32>, v2: Vector3<f32>, v3: Vector3<f32>) -> Vector3<f32> {
+    triangle_cross(v1, v2, v3).normalize()
+}
+
+/// Area = 0.5 * length(triangle_cross)
+fn area(v1: Vector3<f32>, v2: Vector3<f32>, v3: Vector3<f32>) -> f32 {
+    0.5 * triangle_cross(v1, v2, v3).norm()
+}
+
 #[derive(Debug)]
 struct Matrices {
     /// Gradient maps for each face
@@ -284,6 +294,34 @@ pub struct Model {
 }
 
 impl Model {
+    pub fn from_parts(faces: Vec<Vec<usize>>, vertices: Vec<(Vector3<f32>, Vector3<f32>)>) -> Self {
+        let valences = faces
+            .iter()
+            .flat_map(|f| {
+                if f.len() >= 2 {
+                    f.clone()
+                        .into_iter()
+                        .zip(f.clone().into_iter().skip(1).chain(iter::once(f[0])))
+                        .map(|(v1, v2)| if v1 < v2 { [v1, v2] } else { [v2, v1] })
+                        .collect()
+                } else {
+                    vec![]
+                }
+            })
+            .fold(HashMap::new(), |mut acc, e| {
+                *acc.entry(e).or_insert(0) += 1;
+                acc
+            });
+        let edges = valences.keys().copied().collect();
+
+        Self {
+            vertices,
+            faces,
+            edges,
+            valences,
+        }
+    }
+
     pub fn from_obj(model: RawObj) -> Self {
         let RawObj {
             positions,
@@ -312,31 +350,8 @@ impl Model {
             .zip(normals.into_iter())
             .map(|(v, n)| (Vector3::new(v.0, v.1, v.2), Vector3::new(n.0, n.1, n.2)))
             .collect();
-        let valences = faces
-            .iter()
-            .flat_map(|f| {
-                if f.len() >= 2 {
-                    f.clone()
-                        .into_iter()
-                        .zip(f.clone().into_iter().skip(1).chain(iter::once(f[0])))
-                        .map(|(v1, v2)| if v1 < v2 { [v1, v2] } else { [v2, v1] })
-                        .collect()
-                } else {
-                    vec![]
-                }
-            })
-            .fold(HashMap::new(), |mut acc, e| {
-                *acc.entry(e).or_insert(0) += 1;
-                acc
-            });
-        let edges = valences.keys().copied().collect();
 
-        Self {
-            vertices,
-            faces,
-            edges,
-            valences,
-        }
+        Self::from_parts(faces, vertices)
     }
 
     pub fn to_obj(&self) -> RawObj {
@@ -494,7 +509,8 @@ impl Model {
 
     /// Gradient matrix for a given face/triangle
     /// Multiply this with the outcome of a linear polynomial applied on the vertices of the face
-    fn gradient_map(&self, face: &Vec<usize>) -> Matrix3<f32> {
+    fn gradient_map(&self, face: usize) -> Matrix3<f32> {
+        let face = &self.faces[face];
         assert!(face.len() == 3, "Model should be triangulated");
 
         let v = [
@@ -502,19 +518,13 @@ impl Model {
             self.vertices[face[1]].0,
             self.vertices[face[2]].0,
         ];
-        let e = [v[2] - v[1], v[1] - v[0], v[0] - v[2]];
+        let e = [v[2] - v[1], v[0] - v[2], v[1] - v[0]];
 
         // This is the triangle normal, which is distinct from the vertex normals
-        let cross = triangle_cross(v[0], v[1], v[2]);
-        let normal = cross.normalize();
-        let half_inv_area = 1.0 / cross.norm();
+        let n = normal(v[0], v[1], v[2]);
+        let half_inv_area = 0.5 / area(v[0], v[1], v[2]);
 
-        half_inv_area
-            * Matrix3::from_columns(&[
-                normal.cross(&e[0]),
-                normal.cross(&e[1]),
-                normal.cross(&e[2]),
-            ])
+        half_inv_area * Matrix3::from_columns(&[n.cross(&e[0]), n.cross(&e[1]), n.cross(&e[2])])
     }
 
     /// Area of each face/triangle
@@ -522,12 +532,11 @@ impl Model {
         self.faces
             .iter()
             .map(|f| {
-                0.5 * triangle_cross(
+                area(
                     self.vertices[f[0]].0,
                     self.vertices[f[1]].0,
                     self.vertices[f[2]].0,
                 )
-                .magnitude()
             })
             .collect()
     }
@@ -626,7 +635,9 @@ impl Model {
     }
 
     fn differential_coordinates(&self) -> Matrices {
-        let gradient_maps: Vec<_> = self.faces.iter().map(|f| self.gradient_map(f)).collect();
+        let gradient_maps: Vec<_> = (0..self.faces.len())
+            .map(|f| self.gradient_map(f))
+            .collect();
         let areas = self.areas();
         let vertex_faces = self.vertex_faces();
         let cotangent = self.cotangent(&vertex_faces, &gradient_maps, &areas);
@@ -645,50 +656,198 @@ impl Model {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_relative_eq;
+
     use super::*;
+
+    fn build_tetrahedron() -> Model {
+        let v = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, 3.0_f32.sqrt(), 0.0),
+            Vector3::new(0.0, 3.0_f32.sqrt() / 3.0, (8.0 / 3.0_f32).sqrt()),
+        ];
+        Model::from_parts(
+            vec![vec![0, 1, 2], vec![2, 1, 3], vec![0, 2, 3], vec![1, 0, 3]],
+            v.iter().map(|v| (*v, Vector3::zeros())).collect(),
+        )
+    }
+
+    fn build_unequal_tetrahedron() -> Model {
+        let v = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+            Vector3::new(0.0, 3.0_f32.sqrt(), 0.0),
+            Vector3::new(0.0, 3.0_f32.sqrt() / 3.0, 2.0),
+        ];
+        Model::from_parts(
+            vec![vec![0, 1, 2], vec![2, 1, 3], vec![0, 2, 3], vec![1, 0, 3]],
+            v.iter().map(|v| (*v, Vector3::zeros())).collect(),
+        )
+    }
 
     #[test]
     fn triangle_normal_test() {
-        todo!()
+        // Polarity test
+        let v = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 2.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+        ];
+        let n = normal(v[0], v[1], v[2]);
+        assert_relative_eq!(n, Vector3::new(0.0, 0.0, 1.0));
+        let n = normal(v[0], v[2], v[1]);
+        assert_relative_eq!(n, Vector3::new(0.0, 0.0, -1.0));
+
+        // 45 degree slope
+        let v = [
+            Vector3::new(1.0, 0.0, 2.0),
+            Vector3::new(0.0, 2.0, 0.0),
+            Vector3::new(-1.0, 0.0, 2.0),
+        ];
+        let n = normal(v[0], v[1], v[2]);
+        assert_relative_eq!(
+            n,
+            Vector3::new(0.0, 1.0, 1.0) * 0.5 * std::f32::consts::SQRT_2
+        );
     }
 
     #[test]
     fn triangle_area_test() {
-        todo!()
+        let v = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 2.0, 0.0),
+            Vector3::new(-1.0, 0.0, 0.0),
+        ];
+        let a = area(v[0], v[1], v[2]);
+        assert_relative_eq!(a, 0.5 * 2.0 * 2.0);
+        let v = [
+            Vector3::new(1.0, 0.0, 2.0),
+            Vector3::new(0.0, 2.0, 0.0),
+            Vector3::new(-1.0, 0.0, 2.0),
+        ];
+        let a = area(v[0], v[1], v[2]);
+        assert_relative_eq!(a, 0.5 * 2.0 * 8.0_f32.sqrt());
     }
 
     #[test]
     fn gradient_map_test() {
-        todo!()
+        let v = [
+            Vector3::new(1.0, 0.0, 2.0),
+            Vector3::new(0.0, 2.0, 0.0),
+            Vector3::new(-1.0, 0.0, 2.0),
+        ];
+        let e = [
+            Vector3::new(-1.0, -2.0, 2.0),
+            Vector3::new(2.0, 0.0, 0.0),
+            Vector3::new(-1.0, 2.0, -2.0),
+        ];
+        let n = Vector3::new(0.0, 1.0, 1.0) * 0.5 * std::f32::consts::SQRT_2;
+        let a = 0.5 * 2.0 * 8.0_f32.sqrt();
+
+        let mesh = Model::from_parts(vec![vec![0, 1, 2]], vec![(v[0], n), (v[1], n), (v[2], n)]);
+
+        let polynomial = |v: &Vector3<f32>| -> f32 { v.x + v.y * 2.0 };
+        let u = Vector3::from_iterator(v.iter().map(|v| polynomial(v)));
+
+        let gradients = mesh.gradient_map(0) * u;
+        let c: Vec<_> = e
+            .iter()
+            .zip(u.iter())
+            .map(|(e, &u)| u * n.cross(e))
+            .collect();
+        assert_relative_eq!(gradients, 0.5 / a * (c[0] + c[1] + c[2]));
     }
 
     #[test]
     fn mesh_areas_test() {
-        todo!()
+        let tetrahedron = build_tetrahedron();
+        let a = 0.5 * 2.0 * 3.0_f32.sqrt();
+        tetrahedron
+            .areas()
+            .into_iter()
+            .for_each(|f| assert_relative_eq!(f, a));
+
+        let tetrahedron = build_unequal_tetrahedron();
+        let a = 0.5 * 2.0 * 3.0_f32.sqrt();
+        let areas = tetrahedron.areas();
+        assert_relative_eq!(areas[0], a);
+
+        let a = 0.5 * 2.0 * (13.0 / 3.0_f32).sqrt();
+        areas
+            .into_iter()
+            .skip(1)
+            .for_each(|f| assert_relative_eq!(f, a));
     }
 
     #[test]
     fn mesh_vertex_faces_test() {
-        todo!()
+        let tetrahedron = build_tetrahedron();
+        let vertex_faces = tetrahedron.vertex_faces();
+        vertex_faces.values().for_each(|f| assert_eq!(f.len(), 3));
+        assert_eq!(vertex_faces[&0], vec![0, 2, 3]);
+        assert_eq!(vertex_faces[&1], vec![0, 1, 3]);
+        assert_eq!(vertex_faces[&2], vec![0, 1, 2]);
+        assert_eq!(vertex_faces[&3], vec![1, 2, 3]);
     }
 
     #[test]
     fn mesh_cotangent_test() {
-        todo!()
+        let tetrahedron = build_tetrahedron();
+        let Matrices { cotangent, .. } = tetrahedron.differential_coordinates();
+        let mut matrix = Matrix4::zeros();
+
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(cotangent[&i].contains_key(&j));
+                assert_relative_eq!(cotangent[&i][&j], cotangent[&j][&i]);
+                matrix[(i, j)] = cotangent[&i][&j];
+            }
+        }
+
+        // Assert strange defintion of non-negative matrix
+        let v = Vector4::new(1.0, 2.0, 3.0, 4.0);
+        assert!((v.transpose() * matrix * v)[0] > -std::f32::EPSILON);
     }
 
     #[test]
     fn mesh_combinatorial_laplacian_test() {
-        todo!()
-    }
+        let tetrahedron = build_tetrahedron();
+        let Matrices {
+            combinatorial_laplacian,
+            ..
+        } = tetrahedron.differential_coordinates();
 
-    #[test]
-    fn mesh_vertex_areas_test() {
-        todo!()
+        for i in 0..4 {
+            for j in 0..4 {
+                if i == j {
+                    continue;
+                }
+                assert!(combinatorial_laplacian[&i].contains(&j));
+            }
+        }
     }
 
     #[test]
     fn mesh_geometric_laplacian_test() {
-        todo!()
+        let tetrahedron = build_tetrahedron();
+        let Matrices {
+            geometric_laplacian,
+            ..
+        } = tetrahedron.differential_coordinates();
+
+        let mut matrix = Matrix4::zeros();
+        for i in 0..4 {
+            for j in 0..4 {
+                matrix[(i, j)] = geometric_laplacian[&i][&j];
+            }
+        }
+
+        // Assert non-negative eigenvalues
+        matrix
+            .eigenvalues()
+            .unwrap()
+            .into_iter()
+            .for_each(|&e| assert!(e > -std::f32::EPSILON));
     }
 }

@@ -12,6 +12,7 @@ nalgebra-glm = { version = "0.18", features = ["convert-bytemuck"]}
 obj-rs = { git = "https://github.com/fayalalebrun/obj-rs.git", rev = "066b41e"}
 pico-args = "0.5"
 rand = "0.8"
+approx = "0.5"
 
 # visualization-related
 glium = "0.32"

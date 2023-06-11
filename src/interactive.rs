@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use egui::{Color32, Pos2, Rect, Rounding};
 use glium::{
     backend::Facade,
@@ -5,9 +7,10 @@ use glium::{
     Frame, Surface,
 };
 
+use nalgebra::{Matrix3, Vector3};
 use nalgebra_glm::{Mat4, Vec2};
 
-use crate::Model;
+use crate::{Matrices, Model};
 
 use self::{camera::Camera, mesh::Mesh};
 
@@ -22,6 +25,8 @@ pub struct State {
     right: DeltaMouse,
     left: SelectionMouse,
     resolution: Vec2,
+    transformation: Matrix3<f32>,
+    result: Result<(), String>,
 }
 
 struct SelectionMouse {
@@ -121,11 +126,23 @@ impl Default for DeltaMouse {
 impl State {
     pub fn paint_gui(&mut self, ctx: &egui::Context) {
         egui::Window::new("Tools").show(ctx, |ui| {
-            ui.horizontal(|_ui| {
-                // ui.input();
-                // ui.input();
-                // ui.input();
-            })
+            ui.label("Transformation:");
+            egui::Grid::new("matrix").num_columns(3).show(ui, |ui| {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        ui.add(egui::DragValue::new(&mut self.transformation[(i, j)]).speed(0.01));
+                    }
+                    ui.end_row();
+                }
+
+                if ui.button("Apply").clicked() {
+                    self.result = self.transform();
+                }
+            });
+
+            if let Err(e) = self.result.as_ref() {
+                ui.colored_label(Color32::RED, e);
+            }
         });
 
         if self.left.pressed {
@@ -150,8 +167,8 @@ impl State {
 
         let camera_delta = self.right.normalized_delta(resolution);
 
-        self.camera.rotate_y(camera_delta.x * 10.);
-        self.camera.rotate_h(camera_delta.y * 10.);
+        self.camera.rotate_y(camera_delta.x * 1.);
+        self.camera.rotate_h(camera_delta.y * 1.);
 
         let model = Mat4::identity();
         let view = self.camera.view();
@@ -204,7 +221,7 @@ impl State {
                 self.left.handle_position(position);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let base = 0.01;
+                let base = 0.1;
                 let up = 1. + base;
                 let down = 1. - base;
                 let modifier = match delta {
@@ -228,6 +245,39 @@ impl State {
             _ => {}
         }
     }
+
+    pub fn transform(&mut self) -> Result<(), String> {
+        let selected = self.mesh.selected();
+        if selected.is_empty() {
+            return Err("No vertices selected".to_string());
+        }
+
+        let Matrices {
+            combinatorial_laplacian,
+            cotangent,
+            geometric_laplacian,
+            gradient_maps,
+        } = self.model.differential_coordinates();
+
+        let gradients: HashMap<usize, Vector3<f32>> = selected
+            .iter()
+            .flat_map(|&i| {
+                let f = &self.model.faces[i];
+                f.iter()
+                    .map(|&v| (v, gradient_maps[i] * self.model.vertices[v].0))
+                    .collect::<Vec<_>>()
+            })
+            .fold(HashMap::new(), |mut map, (v, f)| {
+                *map.entry(v).or_default() += f;
+                map
+            });
+        let new_gradients: HashMap<_, _> = gradients
+            .iter()
+            .map(|(&v, g)| (v, self.transformation * g))
+            .collect();
+
+        Ok(())
+    }
 }
 
 pub fn start(model: super::Model) {
@@ -245,6 +295,8 @@ pub fn start(model: super::Model) {
         right: Default::default(),
         left: Default::default(),
         resolution: Vec2::new(1., 1.),
+        transformation: Matrix3::identity(),
+        result: Ok(()),
     };
 
     gui::run(&mut state, display, event_loop)

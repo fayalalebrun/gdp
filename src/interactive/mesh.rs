@@ -19,6 +19,7 @@ pub struct Mesh {
     vertices: VertexBuffer<Vertex>,
     indices: IndexBuffer<u32>,
     selected_indices: IndexBuffer<u32>,
+    selected_faces: Vec<usize>,
     program: Program,
 }
 
@@ -62,6 +63,7 @@ impl Mesh {
             vertices,
             indices,
             selected_indices,
+            selected_faces: Vec::new(),
             program,
         }
     }
@@ -87,6 +89,16 @@ impl Mesh {
 
         self.selected_indices =
             IndexBuffer::new(facade, PrimitiveType::TrianglesList, &selected_indices).unwrap();
+
+        self.selected_faces = selected
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| if !s { None } else { Some(i) })
+            .collect();
+    }
+
+    pub fn selected(&self) -> &Vec<usize> {
+        &self.selected_faces
     }
 
     pub fn draw<S: Surface>(

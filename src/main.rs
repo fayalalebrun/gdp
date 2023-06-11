@@ -570,7 +570,7 @@ impl Model {
                         .flat_map(|&f| {
                             let gradient = gradient_maps[f]
                                 .column(self.faces[f].iter().position(|&o| o == v).unwrap());
-                            (0..faces.len())
+                            (0..self.faces[f].len())
                                 .map(|i| {
                                     (
                                         self.faces[f][i],

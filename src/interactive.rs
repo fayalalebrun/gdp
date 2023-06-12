@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, Pos2, Rect, Rounding};
 use glium::{
@@ -7,7 +7,7 @@ use glium::{
     Frame, Surface,
 };
 
-use nalgebra::{Matrix3, Vector3};
+use nalgebra::{CsMatrix, Matrix3, Vector3};
 use nalgebra_glm::{Mat4, Vec2};
 
 use crate::{Matrices, Model};
@@ -252,6 +252,11 @@ impl State {
             return Err("No vertices selected".to_string());
         }
 
+        let selected_vertices: HashSet<_> = selected
+            .iter()
+            .flat_map(|&f| self.model.faces[f].clone())
+            .collect();
+
         let Matrices {
             combinatorial_laplacian,
             cotangent,
@@ -259,22 +264,88 @@ impl State {
             gradient_maps,
         } = self.model.differential_coordinates();
 
-        let gradients: HashMap<usize, Vector3<f32>> = selected
+        let vertices: Vec<_> = self
+            .model
+            .vertices
             .iter()
-            .flat_map(|&i| {
-                let f = &self.model.faces[i];
-                f.iter()
-                    .map(|&v| (v, gradient_maps[i] * self.model.vertices[v].0))
+            .enumerate()
+            .filter_map(|(i, (v, _))| {
+                if selected_vertices.contains(&i) {
+                    Some((i, *v))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Position of vertex in selected vector
+        let indices: HashMap<_, _> = (0..vertices.len()).map(|i| (vertices[i].0, i)).collect();
+
+        let row_idx: Vec<_> = (0..3 * selected.len()).flat_map(|i| [i; 3]).collect();
+        let col_idx: Vec<_> = selected
+            .iter()
+            .flat_map(|&f| {
+                self.model.faces[f]
+                    .iter()
+                    .map(|v| indices[v])
+                    .flat_map(|i| [i; 3])
+            })
+            .collect();
+        let values: Vec<_> = selected
+            .iter()
+            .flat_map(|&f| {
+                (0..self.model.faces[f].len())
+                    .flat_map(|i| {
+                        gradient_maps[f]
+                            .column(i)
+                            .iter()
+                            .copied()
+                            .collect::<Vec<_>>()
+                    })
                     .collect::<Vec<_>>()
             })
-            .fold(HashMap::new(), |mut map, (v, f)| {
-                *map.entry(v).or_default() += f;
-                map
-            });
-        let new_gradients: HashMap<_, _> = gradients
-            .iter()
-            .map(|(&v, g)| (v, self.transformation * g))
             .collect();
+
+        let g: CsMatrix<f32> = CsMatrix::from_triplet(
+            3 * selected.len(),
+            selected_vertices.len(),
+            &row_idx,
+            &col_idx,
+            &values,
+        );
+
+        let row_idx: Vec<_> = vertices
+            .iter()
+            .flat_map(|(v1, _)| {
+                std::iter::repeat(indices[v1]).take(
+                    cotangent[v1]
+                        .keys()
+                        .filter(|v2| selected_vertices.contains(v2))
+                        .count(),
+                )
+            })
+            .collect();
+        let col_idx: Vec<_> = vertices
+            .iter()
+            .flat_map(|(v1, _)| cotangent[v1].keys().filter_map(|v2| indices.get(v2)))
+            .copied()
+            .collect();
+        let values: Vec<_> = row_idx
+            .iter()
+            .zip(col_idx.iter())
+            .map(|(v1, v2)| cotangent[&vertices[*v1].0][&vertices[*v2].0])
+            .collect();
+
+        // The cotangent represents the left-hand side of the eqaution, i.e. G^T*M_V*G
+        let cotangent = CsMatrix::from_triplet(
+            selected_vertices.len(),
+            selected_vertices.len(),
+            &row_idx,
+            &col_idx,
+            &values,
+        );
+
+        let vertices: Vec<_> = vertices.into_iter().map(|(_, v)| v).collect();
 
         Ok(())
     }

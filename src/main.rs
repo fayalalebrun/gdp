@@ -630,7 +630,15 @@ impl Model {
     ) -> HashMap<usize, HashMap<usize, f32>> {
         combined_area
             .iter()
-            .map(|(v, &a)| (*v, cotangent[v].iter().map(|(&o, &f)| (o, a * f)).collect()))
+            .map(|(v, &a)| {
+                (
+                    *v,
+                    cotangent[v]
+                        .iter()
+                        .map(|(&o, &f)| (o, a * f))
+                        .collect::<HashMap<usize, f32>>(),
+                )
+            })
             .collect()
     }
 

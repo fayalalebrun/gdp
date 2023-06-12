@@ -9,6 +9,7 @@ edition = "2021"
 lstsq = "0.5"
 nalgebra = { version = "0.32", features = ["sparse"] }
 nalgebra-glm = { version = "0.18", features = ["convert-bytemuck"]}
+nalgebra-sparse = { version = "0.9" }
 obj-rs = { git = "https://github.com/fayalalebrun/obj-rs.git", rev = "066b41e"}
 pico-args = "0.5"
 rand = "0.8"

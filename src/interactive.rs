@@ -7,10 +7,11 @@ use glium::{
     Frame, Surface,
 };
 
-use nalgebra::{CsMatrix, Matrix3, Vector3};
-use nalgebra_glm::{Mat4, Vec2};
+use nalgebra::{CsMatrix, DMatrix, Dim, Matrix3, VecStorage};
+use nalgebra_glm::{Mat4, Vec2, Vec3};
+use nalgebra_sparse::{factorization::CscCholesky, CooMatrix, CscMatrix};
 
-use crate::{Matrices, Model};
+use crate::{area, Matrices, Model};
 
 use self::{camera::Camera, mesh::Mesh};
 
@@ -27,6 +28,7 @@ pub struct State {
     resolution: Vec2,
     transformation: Matrix3<f32>,
     result: Result<(), String>,
+    refresh_mesh: bool,
 }
 
 struct SelectionMouse {
@@ -161,6 +163,11 @@ impl State {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, facade: &dyn Facade) {
+        if self.refresh_mesh {
+            self.refresh_mesh = false;
+            self.mesh = Mesh::load(facade, &self.model);
+        }
+
         let (width, height) = frame.get_dimensions();
         let resolution = Vec2::new(width as f32, height as f32);
         self.resolution = resolution;
@@ -306,13 +313,16 @@ impl State {
             })
             .collect();
 
-        let g: CsMatrix<f32> = CsMatrix::from_triplet(
+        let g = CooMatrix::try_from_triplets(
             3 * selected.len(),
             selected_vertices.len(),
-            &row_idx,
-            &col_idx,
-            &values,
-        );
+            row_idx,
+            col_idx,
+            values,
+        )
+        .unwrap();
+
+        let g = CscMatrix::from(&g);
 
         let row_idx: Vec<_> = vertices
             .iter()
@@ -337,17 +347,87 @@ impl State {
             .collect();
 
         // The cotangent represents the left-hand side of the eqaution, i.e. G^T*M_V*G
-        let cotangent = CsMatrix::from_triplet(
+        let cotangent = CooMatrix::try_from_triplets(
             selected_vertices.len(),
             selected_vertices.len(),
-            &row_idx,
-            &col_idx,
-            &values,
-        );
+            row_idx,
+            col_idx,
+            values,
+        )
+        .unwrap();
 
-        let vertices: Vec<_> = vertices.into_iter().map(|(_, v)| v).collect();
+        let cotangent = CscMatrix::from(&cotangent);
+
+        let gradients = selected.iter().flat_map(|f| {
+            (0..3).into_iter().map(|i| {
+                let v = self.model.vertices[self.model.faces[*f][i]].0;
+                let map = gradient_maps[*f];
+                map * v
+            })
+        });
+
+        let g_tilde = gradients
+            .map(|g| self.transformation * g)
+            .collect::<Vec<_>>();
+
+        let areas = self.model.areas();
+
+        const TRIANGLE_VERTS: usize = 3;
+        // Generate elements for M_v matrix
+        let mut coo = CooMatrix::new(selected.len() * 3, selected.len() * 3);
+        self.mesh
+            .selected()
+            .iter()
+            .enumerate()
+            .for_each(|(idx, tidx)| {
+                (0..TRIANGLE_VERTS).for_each(|idx2| {
+                    let fidx = idx * TRIANGLE_VERTS + idx2;
+                    coo.push(fidx, fidx, areas[*tidx])
+                })
+            });
+
+        let m_v = CscMatrix::from(&coo);
+
+        let gtmv = g.transpose() * m_v;
+
+        let g_tilde_x = g_tilde.iter().map(|g| g.x).collect::<Vec<_>>();
+        let g_tilde_y = g_tilde.iter().map(|g| g.y).collect::<Vec<_>>();
+        let g_tilde_z = g_tilde.iter().map(|g| g.z).collect::<Vec<_>>();
+        let v_tilde_x = Self::solve_system(g_tilde_x, &gtmv, &cotangent);
+        let v_tilde_y = Self::solve_system(g_tilde_y, &gtmv, &cotangent);
+        let v_tilde_z = Self::solve_system(g_tilde_z, &gtmv, &cotangent);
+
+        let v_tilde = v_tilde_x
+            .into_iter()
+            .zip(v_tilde_y.into_iter().zip(v_tilde_z.into_iter()))
+            .map(|(x, (y, z))| Vec3::new(*x, *y, *z));
+
+        selected_vertices
+            .into_iter()
+            .zip(v_tilde.into_iter())
+            .for_each(|(idx, v)| {
+                self.model.vertices[idx].0 = v;
+            });
+
+        self.refresh_mesh = true;
 
         Ok(())
+    }
+
+    pub fn solve_system(
+        g_tilde: Vec<f32>,
+        gtmv: &CscMatrix<f32>,
+        cotangent: &CscMatrix<f32>,
+    ) -> DMatrix<f32> {
+        let g_tilde = DMatrix::from_vec_storage(VecStorage::new(
+            Dim::from_usize(g_tilde.len()),
+            Dim::from_usize(1),
+            g_tilde,
+        ));
+
+        let b = gtmv * g_tilde;
+        let a = CscCholesky::factor(cotangent).unwrap();
+        a.solve(&b)
     }
 }
 
@@ -368,6 +448,7 @@ pub fn start(model: super::Model) {
         resolution: Vec2::new(1., 1.),
         transformation: Matrix3::identity(),
         result: Ok(()),
+        refresh_mesh: false,
     };
 
     gui::run(&mut state, display, event_loop)

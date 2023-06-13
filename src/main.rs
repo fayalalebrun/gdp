@@ -7,7 +7,7 @@ use std::{
 };
 
 use nalgebra::{DVector, Matrix3, Matrix4, Matrix6, Point3, Vector, Vector3, Vector4, Vector6};
-use nalgebra_glm::{Mat4, Vec2};
+use nalgebra_glm::{Mat4, Vec2, Vec3};
 use nalgebra_sparse::{CooMatrix, CscMatrix};
 use obj::raw::{object::Polygon, parse_obj, RawObj};
 use rand::seq::SliceRandom;
@@ -282,6 +282,8 @@ struct Matrices {
     pub m_v: CscMatrix<f32>,
     /// Selected vertices
     pub v: Vector3<DVector<f32>>,
+
+    pub m: CscMatrix<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -642,23 +644,14 @@ impl Model {
             .collect()
     }
 
-    fn differential_coordinates(&self, selected_faces: &Vec<usize>) -> Matrices {
-        let selected_vertices: HashSet<_> = selected_faces
+    fn differential_coordinates(
+        &self,
+        selected_faces: &Vec<usize>,
+        selected_vertices: &Vec<usize>,
+    ) -> Matrices {
+        let vertices: Vec<_> = selected_vertices
             .iter()
-            .flat_map(|&f| self.faces[f].clone())
-            .collect();
-
-        let vertices: Vec<_> = self
-            .vertices
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (v, _))| {
-                if selected_vertices.contains(&i) {
-                    Some((i, *v))
-                } else {
-                    None
-                }
-            })
+            .map(|i| (i, self.vertices[*i].0))
             .collect();
 
         let indices: HashMap<_, _> = (0..vertices.len()).map(|i| (vertices[i].0, i)).collect();
@@ -693,18 +686,27 @@ impl Model {
 
         let m_v = CscMatrix::from(&coo);
 
+        let vertex_faces = self.vertex_faces(selected_faces);
+        let vertex_areas = self.vertex_areas(&vertex_faces, &areas);
+
+        let mut coo = CooMatrix::new(selected_vertices.len(), selected_vertices.len());
+        selected_vertices
+            .iter()
+            .enumerate()
+            .for_each(|(idx, vert_idx)| coo.push(idx, idx, vertex_areas[vert_idx]));
+
+        let m = CscMatrix::from(&coo);
+
         let v =
             Vector3::from_iterator((0..3).map(|i| {
                 DVector::from_iterator(vertices.len(), vertices.iter().map(|(_, v)| v[i]))
             }));
 
-        // let vertex_faces = self.vertex_faces(selected_faces);
-        // let cotangent = self.cotangent(&vertex_faces, &gradient_maps, &areas);
         // let combinatorial_laplacian = self.neighbors(&vertex_faces);
-        // let vertex_areas = self.vertex_areas(&vertex_faces, &areas);
+        // let cotangent = self.cotangent(&vertex_faces, &gradient_maps, &areas);
         // let geometric_laplacian = self.geometric_laplacian(&vertex_areas, &cotangent);
 
-        Matrices { g, m_v, v }
+        Matrices { g, m_v, v, m }
     }
 }
 

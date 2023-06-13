@@ -259,7 +259,16 @@ impl State {
             return Err("No vertices selected".to_string());
         }
 
-        let Matrices { g, m_v, v } = self.model.differential_coordinates(selected);
+        let selected_vertices = selected
+            .iter()
+            .flat_map(|&f| self.model.faces[f].clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let Matrices { g, m_v, v, m } = self
+            .model
+            .differential_coordinates(selected, &selected_vertices);
 
         let g_x = &g * &v.x;
         let g_y = &g * &v.y;
@@ -273,31 +282,26 @@ impl State {
         let g_tilde_y = g_tilde.iter().map(|g| g.y).collect::<Vec<_>>();
         let g_tilde_z = g_tilde.iter().map(|g| g.z).collect::<Vec<_>>();
 
-        let gtmv = g.transpose() * m_v;
+        let gtmv = &g.transpose() * &m_v;
 
-        let v_tilde_x = Self::solve_system(g_tilde_x, &gtmv, &(&gtmv * &g));
-        let v_tilde_y = Self::solve_system(g_tilde_y, &gtmv, &(&gtmv * &g));
-        let v_tilde_z = Self::solve_system(g_tilde_z, &gtmv, &(&gtmv * &g));
+        let cotangent = (&gtmv * &g) + 0.001 * m;
+
+        let v_tilde_x = Self::solve_system(g_tilde_x, &gtmv, &cotangent);
+        let v_tilde_y = Self::solve_system(g_tilde_y, &gtmv, &cotangent);
+        let v_tilde_z = Self::solve_system(g_tilde_z, &gtmv, &cotangent);
 
         let v_tilde: Vec<_> = v_tilde_x
             .into_iter()
             .zip(v_tilde_y.into_iter().zip(v_tilde_z.into_iter()))
-            .map(|(x, (y, z))| Vec3::new(*x, *y, *z)).collect();
-
-        let selected_vertices = selected
-            .iter()
-            .flat_map(|&f| self.model.faces[f].clone())
-            .collect::<HashSet<_>>();
+            .map(|(x, (y, z))| Vec3::new(*x, *y, *z))
+            .collect();
 
         let center = selected_vertices
             .iter()
             .map(|&v| self.model.vertices[v].0)
             .sum::<Vector3<_>>()
             / self.model.vertices.len() as f32;
-        let center_tilde = v_tilde
-            .iter()
-            .sum::<Vector3<_>>()
-            / self.model.vertices.len() as f32;
+        let center_tilde = v_tilde.iter().sum::<Vector3<_>>() / self.model.vertices.len() as f32;
 
         let offset = center - center_tilde;
 

@@ -262,13 +262,14 @@ impl State {
         let selected_vertices = selected
             .iter()
             .flat_map(|&f| self.model.faces[f].clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+
+        let triangle_idxs = (0..self.model.faces.len()).collect::<Vec<_>>();
+        let vert_idxs = (0..self.model.vertices.len()).collect::<Vec<_>>();
 
         let Matrices { g, m_v, v, m } = self
             .model
-            .differential_coordinates(selected, &selected_vertices);
+            .differential_coordinates(&triangle_idxs, &vert_idxs);
 
         let g_x = &g * &v.x;
         let g_y = &g * &v.y;
@@ -276,7 +277,13 @@ impl State {
 
         let g_tilde = DVector::from_iterator(
             g_x.len(),
-            (0..g_x.len()).map(|i| self.transformation * Vector3::new(g_x[i], g_y[i], g_z[i])),
+            (0..g_x.len()).map(|i| {
+                if selected_vertices.contains(&i) {
+                    self.transformation * Vector3::new(g_x[i], g_y[i], g_z[i])
+                } else {
+                    Vector3::new(g_x[i], g_y[i], g_z[i])
+                }
+            }),
         );
         let g_tilde_x = g_tilde.iter().map(|g| g.x).collect::<Vec<_>>();
         let g_tilde_y = g_tilde.iter().map(|g| g.y).collect::<Vec<_>>();
@@ -296,7 +303,7 @@ impl State {
             .map(|(x, (y, z))| Vec3::new(*x, *y, *z))
             .collect();
 
-        let center = selected_vertices
+        let center = vert_idxs
             .iter()
             .map(|&v| self.model.vertices[v].0)
             .sum::<Vector3<_>>()
@@ -305,12 +312,9 @@ impl State {
 
         let offset = center - center_tilde;
 
-        selected_vertices
-            .into_iter()
-            .zip(v_tilde)
-            .for_each(|(idx, v)| {
-                self.model.vertices[idx].0 = v + offset;
-            });
+        vert_idxs.into_iter().zip(v_tilde).for_each(|(idx, v)| {
+            self.model.vertices[idx].0 = v + offset;
+        });
 
         self.refresh_mesh = true;
 

@@ -6,8 +6,9 @@ use std::{
     str::FromStr,
 };
 
-use nalgebra::{Matrix3, Matrix4, Matrix6, Point3, Vector3, Vector4, Vector6};
+use nalgebra::{DVector, Matrix3, Matrix4, Matrix6, Point3, Vector, Vector3, Vector4, Vector6};
 use nalgebra_glm::{Mat4, Vec2};
+use nalgebra_sparse::{CooMatrix, CscMatrix};
 use obj::raw::{object::Polygon, parse_obj, RawObj};
 use rand::seq::SliceRandom;
 
@@ -275,14 +276,12 @@ fn area(v1: Vector3<f32>, v2: Vector3<f32>, v3: Vector3<f32>) -> f32 {
 
 #[derive(Debug)]
 struct Matrices {
-    /// Gradient maps for each face
-    pub gradient_maps: Vec<Matrix3<f32>>,
-    /// Cotangent for each vertex pair
-    pub cotangent: HashMap<usize, HashMap<usize, f32>>,
-    /// Neighbors for each vertex, used for combinatorial laplacian
-    pub combinatorial_laplacian: HashMap<usize, Vec<usize>>,
-    /// Geometric laplacian
-    pub geometric_laplacian: HashMap<usize, HashMap<usize, f32>>,
+    /// Gradient matrix
+    pub g: CscMatrix<f32>,
+    /// Mass matrix
+    pub m_v: CscMatrix<f32>,
+    /// Selected vertices
+    pub v: Vector3<DVector<f32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -528,10 +527,11 @@ impl Model {
     }
 
     /// Area of each face/triangle
-    fn areas(&self) -> Vec<f32> {
-        self.faces
+    fn areas(&self, selected_faces: &Vec<usize>) -> Vec<f32> {
+        selected_faces
             .iter()
-            .map(|f| {
+            .map(|&f| {
+                let f = &self.faces[f];
                 area(
                     self.vertices[f[0]].0,
                     self.vertices[f[1]].0,
@@ -542,11 +542,11 @@ impl Model {
     }
 
     /// Collection of faces each vertex belongs to
-    fn vertex_faces(&self) -> HashMap<usize, Vec<usize>> {
-        self.faces
+    fn vertex_faces(&self, selected_faces: &Vec<usize>) -> HashMap<usize, Vec<usize>> {
+        selected_faces
             .iter()
             .enumerate()
-            .flat_map(|(i, f)| f.iter().map(|v| (*v, i)).collect::<Vec<_>>())
+            .flat_map(|(i, &f)| self.faces[f].iter().map(|v| (*v, i)).collect::<Vec<_>>())
             .fold(HashMap::new(), |mut map, (v, f)| {
                 map.entry(v).or_default().push(f);
                 map
@@ -642,23 +642,69 @@ impl Model {
             .collect()
     }
 
-    fn differential_coordinates(&self) -> Matrices {
-        let gradient_maps: Vec<_> = (0..self.faces.len())
-            .map(|f| self.gradient_map(f))
+    fn differential_coordinates(&self, selected_faces: &Vec<usize>) -> Matrices {
+        let selected_vertices: HashSet<_> = selected_faces
+            .iter()
+            .flat_map(|&f| self.faces[f].clone())
             .collect();
-        let areas = self.areas();
-        let vertex_faces = self.vertex_faces();
-        let cotangent = self.cotangent(&vertex_faces, &gradient_maps, &areas);
-        let combinatorial_laplacian = self.neighbors(&vertex_faces);
-        let vertex_areas = self.vertex_areas(&vertex_faces, &areas);
-        let geometric_laplacian = self.geometric_laplacian(&vertex_areas, &cotangent);
 
-        Matrices {
-            gradient_maps,
-            cotangent,
-            combinatorial_laplacian,
-            geometric_laplacian,
-        }
+        let vertices: Vec<_> = self
+            .vertices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (v, _))| {
+                if selected_vertices.contains(&i) {
+                    Some((i, *v))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let indices: HashMap<_, _> = (0..vertices.len()).map(|i| (vertices[i].0, i)).collect();
+        let gradient_maps: Vec<_> = selected_faces
+            .iter()
+            .map(|&f| self.gradient_map(f))
+            .collect();
+        let areas = self.areas(selected_faces);
+
+        let mut g = CooMatrix::new(selected_faces.len() * 3, selected_vertices.len());
+        selected_faces.iter().enumerate().for_each(|(i, &f)| {
+            (0..self.faces[f].len()).for_each(|v| {
+                (0..3).for_each(|d| {
+                    g.push(
+                        i * 3 + d,
+                        indices[&self.faces[f][v]],
+                        gradient_maps[i][(d, v)],
+                    )
+                });
+            })
+        });
+
+        let g = CscMatrix::from(&g);
+
+        let mut coo = CooMatrix::new(selected_faces.len() * 3, selected_faces.len() * 3);
+        selected_faces.iter().enumerate().for_each(|(i, &f)| {
+            (0..self.faces[f].len()).for_each(|v| {
+                let fidx = i * 3 + v;
+                coo.push(fidx, fidx, areas[i])
+            })
+        });
+
+        let m_v = CscMatrix::from(&coo);
+
+        let v =
+            Vector3::from_iterator((0..3).map(|i| {
+                DVector::from_iterator(vertices.len(), vertices.iter().map(|(_, v)| v[i]))
+            }));
+
+        // let vertex_faces = self.vertex_faces(selected_faces);
+        // let cotangent = self.cotangent(&vertex_faces, &gradient_maps, &areas);
+        // let combinatorial_laplacian = self.neighbors(&vertex_faces);
+        // let vertex_areas = self.vertex_areas(&vertex_faces, &areas);
+        // let geometric_laplacian = self.geometric_laplacian(&vertex_areas, &cotangent);
+
+        Matrices { g, m_v, v }
     }
 }
 
@@ -772,13 +818,13 @@ mod tests {
         let tetrahedron = build_tetrahedron();
         let a = 0.5 * 2.0 * 3.0_f32.sqrt();
         tetrahedron
-            .areas()
+            .areas(&vec![0, 1, 2, 3])
             .into_iter()
             .for_each(|f| assert_relative_eq!(f, a));
 
         let tetrahedron = build_unequal_tetrahedron();
         let a = 0.5 * 2.0 * 3.0_f32.sqrt();
-        let areas = tetrahedron.areas();
+        let areas = tetrahedron.areas(&vec![0, 1, 2, 3]);
         assert_relative_eq!(areas[0], a);
 
         let a = 0.5 * 2.0 * (13.0 / 3.0_f32).sqrt();
@@ -791,7 +837,7 @@ mod tests {
     #[test]
     fn mesh_vertex_faces_test() {
         let tetrahedron = build_tetrahedron();
-        let vertex_faces = tetrahedron.vertex_faces();
+        let vertex_faces = tetrahedron.vertex_faces(&vec![0, 1, 2, 3]);
         vertex_faces.values().for_each(|f| assert_eq!(f.len(), 3));
         assert_eq!(vertex_faces[&0], vec![0, 2, 3]);
         assert_eq!(vertex_faces[&1], vec![0, 1, 3]);
@@ -802,7 +848,7 @@ mod tests {
     #[test]
     fn mesh_cotangent_test() {
         let tetrahedron = build_tetrahedron();
-        let Matrices { cotangent, .. } = tetrahedron.differential_coordinates();
+        let Matrices { cotangent, .. } = tetrahedron.differential_coordinates(&vec![0, 1, 2, 3]);
         let mut matrix = Matrix4::zeros();
 
         for i in 0..4 {
@@ -824,7 +870,7 @@ mod tests {
         let Matrices {
             combinatorial_laplacian,
             ..
-        } = tetrahedron.differential_coordinates();
+        } = tetrahedron.differential_coordinates(&vec![0, 1, 2, 3]);
 
         for i in 0..4 {
             for j in 0..4 {
@@ -842,7 +888,7 @@ mod tests {
         let Matrices {
             geometric_laplacian,
             ..
-        } = tetrahedron.differential_coordinates();
+        } = tetrahedron.differential_coordinates(&vec![0, 1, 2, 3]);
 
         let mut matrix = Matrix4::zeros();
         for i in 0..4 {

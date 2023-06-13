@@ -7,7 +7,7 @@ use glium::{
     Frame, Surface,
 };
 
-use nalgebra::{CsMatrix, DMatrix, Dim, Matrix3, VecStorage};
+use nalgebra::{CsMatrix, DMatrix, DVector, Dim, Matrix3, VecStorage, Vector3};
 use nalgebra_glm::{Mat4, Vec2, Vec3};
 use nalgebra_sparse::{factorization::CscCholesky, CooMatrix, CscMatrix};
 
@@ -259,154 +259,53 @@ impl State {
             return Err("No vertices selected".to_string());
         }
 
-        let selected_vertices: HashSet<_> = selected
-            .iter()
-            .flat_map(|&f| self.model.faces[f].clone())
-            .collect();
+        let Matrices { g, m_v, v } = self.model.differential_coordinates(selected);
 
-        let Matrices {
-            combinatorial_laplacian,
-            cotangent,
-            geometric_laplacian,
-            gradient_maps,
-        } = self.model.differential_coordinates();
+        let g_x = &g * &v.x;
+        let g_y = &g * &v.y;
+        let g_z = &g * &v.z;
 
-        let vertices: Vec<_> = self
-            .model
-            .vertices
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (v, _))| {
-                if selected_vertices.contains(&i) {
-                    Some((i, *v))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Position of vertex in selected vector
-        let indices: HashMap<_, _> = (0..vertices.len()).map(|i| (vertices[i].0, i)).collect();
-
-        let row_idx: Vec<_> = (0..3 * selected.len()).flat_map(|i| [i; 3]).collect();
-        let col_idx: Vec<_> = selected
-            .iter()
-            .flat_map(|&f| {
-                self.model.faces[f]
-                    .iter()
-                    .map(|v| indices[v])
-                    .flat_map(|i| [i; 3])
-            })
-            .collect();
-        let values: Vec<_> = selected
-            .iter()
-            .flat_map(|&f| {
-                (0..self.model.faces[f].len())
-                    .flat_map(|i| {
-                        gradient_maps[f]
-                            .column(i)
-                            .iter()
-                            .copied()
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        let g = CooMatrix::try_from_triplets(
-            3 * selected.len(),
-            selected_vertices.len(),
-            row_idx,
-            col_idx,
-            values,
-        )
-        .unwrap();
-
-        let g = CscMatrix::from(&g);
-
-        let row_idx: Vec<_> = vertices
-            .iter()
-            .flat_map(|(v1, _)| {
-                std::iter::repeat(indices[v1]).take(
-                    cotangent[v1]
-                        .keys()
-                        .filter(|v2| selected_vertices.contains(v2))
-                        .count(),
-                )
-            })
-            .collect();
-        let col_idx: Vec<_> = vertices
-            .iter()
-            .flat_map(|(v1, _)| cotangent[v1].keys().filter_map(|v2| indices.get(v2)))
-            .copied()
-            .collect();
-        let values: Vec<_> = row_idx
-            .iter()
-            .zip(col_idx.iter())
-            .map(|(v1, v2)| cotangent[&vertices[*v1].0][&vertices[*v2].0])
-            .collect();
-
-        // The cotangent represents the left-hand side of the eqaution, i.e. G^T*M_V*G
-        let cotangent = CooMatrix::try_from_triplets(
-            selected_vertices.len(),
-            selected_vertices.len(),
-            row_idx,
-            col_idx,
-            values,
-        )
-        .unwrap();
-
-        let cotangent = CscMatrix::from(&cotangent);
-
-        let gradients = selected.iter().flat_map(|f| {
-            (0..3).into_iter().map(|i| {
-                let v = self.model.vertices[self.model.faces[*f][i]].0;
-                let map = gradient_maps[*f];
-                map * v
-            })
-        });
-
-        let g_tilde = gradients
-            .map(|g| self.transformation * g)
-            .collect::<Vec<_>>();
-
-        let areas = self.model.areas();
-
-        const TRIANGLE_VERTS: usize = 3;
-        // Generate elements for M_v matrix
-        let mut coo = CooMatrix::new(selected.len() * 3, selected.len() * 3);
-        self.mesh
-            .selected()
-            .iter()
-            .enumerate()
-            .for_each(|(idx, tidx)| {
-                (0..TRIANGLE_VERTS).for_each(|idx2| {
-                    let fidx = idx * TRIANGLE_VERTS + idx2;
-                    coo.push(fidx, fidx, areas[*tidx])
-                })
-            });
-
-        let m_v = CscMatrix::from(&coo);
-
-        let gtmv = g.transpose() * m_v;
-
+        let g_tilde = DVector::from_iterator(
+            g_x.len(),
+            (0..g_x.len()).map(|i| self.transformation * Vector3::new(g_x[i], g_y[i], g_z[i])),
+        );
         let g_tilde_x = g_tilde.iter().map(|g| g.x).collect::<Vec<_>>();
         let g_tilde_y = g_tilde.iter().map(|g| g.y).collect::<Vec<_>>();
         let g_tilde_z = g_tilde.iter().map(|g| g.z).collect::<Vec<_>>();
-        let v_tilde_x = Self::solve_system(g_tilde_x, &gtmv, &cotangent);
-        let v_tilde_y = Self::solve_system(g_tilde_y, &gtmv, &cotangent);
-        let v_tilde_z = Self::solve_system(g_tilde_z, &gtmv, &cotangent);
 
-        let v_tilde = v_tilde_x
+        let gtmv = g.transpose() * m_v;
+
+        let v_tilde_x = Self::solve_system(g_tilde_x, &gtmv, &(&gtmv * &g));
+        let v_tilde_y = Self::solve_system(g_tilde_y, &gtmv, &(&gtmv * &g));
+        let v_tilde_z = Self::solve_system(g_tilde_z, &gtmv, &(&gtmv * &g));
+
+        let v_tilde: Vec<_> = v_tilde_x
             .into_iter()
             .zip(v_tilde_y.into_iter().zip(v_tilde_z.into_iter()))
-            .map(|(x, (y, z))| Vec3::new(*x, *y, *z));
+            .map(|(x, (y, z))| Vec3::new(*x, *y, *z)).collect();
+
+        let selected_vertices = selected
+            .iter()
+            .flat_map(|&f| self.model.faces[f].clone())
+            .collect::<HashSet<_>>();
+
+        let center = selected_vertices
+            .iter()
+            .map(|&v| self.model.vertices[v].0)
+            .sum::<Vector3<_>>()
+            / self.model.vertices.len() as f32;
+        let center_tilde = v_tilde
+            .iter()
+            .sum::<Vector3<_>>()
+            / self.model.vertices.len() as f32;
+
+        let offset = center - center_tilde;
 
         selected_vertices
             .into_iter()
-            .zip(v_tilde.into_iter())
+            .zip(v_tilde)
             .for_each(|(idx, v)| {
-                self.model.vertices[idx].0 = v;
+                self.model.vertices[idx].0 = v + offset;
             });
 
         self.refresh_mesh = true;

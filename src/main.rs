@@ -592,8 +592,8 @@ impl Model {
 
     /// The neighbor vertices for each vertex
     /// This can be used for computing the combinatorial laplacian
-    fn neighbors(&self, vertex_faces: &HashMap<usize, Vec<usize>>) -> HashMap<usize, Vec<usize>> {
-        vertex_faces
+    pub fn neighbors(&self, selected_faces: &Vec<usize>) -> HashMap<usize, Vec<usize>> {
+        self.vertex_faces(selected_faces)
             .iter()
             .map(|(&v, faces)| {
                 (

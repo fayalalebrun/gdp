@@ -136,11 +136,23 @@ impl State {
                     }
                     ui.end_row();
                 }
-
-                if ui.button("Apply").clicked() {
-                    self.result = self.transform();
-                }
             });
+
+            if ui.button("Apply").clicked() {
+                self.result = self.transform();
+            }
+
+            ui.separator();
+
+            if ui.button("Smooth Combinatorial").clicked() {
+                self.smooth_combinatorial(0.5);
+            }
+
+            ui.separator();
+
+            if ui.button("Smooth Geometric").clicked() {
+                self.smooth_geometric(0.5);
+            }
 
             if let Err(e) = self.result.as_ref() {
                 ui.colored_label(Color32::RED, e);
@@ -335,6 +347,82 @@ impl State {
         let b = gtmv * g_tilde;
         let a = CscCholesky::factor(cotangent).unwrap();
         a.solve(&b)
+    }
+
+    pub fn smooth_combinatorial(&mut self, factor: f32) {
+        let mut selected = self.mesh.selected().clone();
+
+        if selected.is_empty() {
+            selected = (0..self.model.faces.len()).collect::<Vec<_>>();
+        }
+
+        let selected_faces: Vec<_> = (0..self.model.faces.len()).collect();
+        let neighbors = self.model.neighbors(&selected_faces);
+        let n = neighbors.len();
+
+        let vertices: Vec<_> = self
+            .model
+            .vertices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                if neighbors.contains_key(&i) {
+                    Some((i, v.0))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let indices: HashMap<_, _> = (0..vertices.len()).map(|i| (vertices[i].0, i)).collect();
+
+        let v_x = DVector::from_iterator(vertices.len(), vertices.iter().map(|v| v.1.x));
+        let v_y = DVector::from_iterator(vertices.len(), vertices.iter().map(|v| v.1.y));
+        let v_z = DVector::from_iterator(vertices.len(), vertices.iter().map(|v| v.1.z));
+
+        let mut cl = CooMatrix::new(n, n);
+        vertices.iter().for_each(|(v1, _)| {
+            let i = indices[v1];
+            cl.push(i, i, 1.0);
+            let deg = neighbors[v1]
+                .iter()
+                .filter(|v2| indices.contains_key(v2))
+                .count();
+            neighbors[v1]
+                .iter()
+                .filter(|v2| indices.contains_key(v2))
+                .for_each(|v2| cl.push(i, indices[v2], -1.0 / deg as f32))
+        });
+
+        let cl = CscMatrix::from(&cl);
+
+        let v_tilde_x = &cl * v_x;
+        let v_tilde_y = &cl * v_y;
+        let v_tilde_z = &cl * v_z;
+
+        let v_tilde: Vec<_> = v_tilde_x
+            .into_iter()
+            .zip(v_tilde_y.into_iter().zip(v_tilde_z.into_iter()))
+            .map(|(x, (y, z))| Vec3::new(*x, *y, *z))
+            .collect();
+
+        let selected_vertices = selected
+            .iter()
+            .flat_map(|&f| self.model.faces[f].clone())
+            .collect::<HashSet<_>>();
+
+        vertices
+            .iter()
+            .zip(v_tilde.iter())
+            .filter(|((i, _), _)| selected_vertices.contains(i))
+            .for_each(|((i, _), v)| {
+                self.model.vertices[*i].0 -= factor * v;
+            });
+
+        self.refresh_mesh = true;
+    }
+
+    pub fn smooth_geometric(&mut self, factor: f32) {
     }
 }
 

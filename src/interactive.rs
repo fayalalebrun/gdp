@@ -29,6 +29,8 @@ pub struct State {
     transformation: Matrix3<f32>,
     result: Result<(), String>,
     refresh_mesh: bool,
+    combinatorial_factor: f32,
+    geometric_factor: f32,
 }
 
 struct SelectionMouse {
@@ -144,15 +146,21 @@ impl State {
 
             ui.separator();
 
-            if ui.button("Smooth Combinatorial").clicked() {
-                self.smooth_combinatorial(0.5);
-            }
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.combinatorial_factor).speed(0.01));
+                if ui.button("Smooth Combinatorial").clicked() {
+                    self.smooth_combinatorial(self.combinatorial_factor);
+                }
+            });
 
             ui.separator();
 
-            if ui.button("Smooth Geometric").clicked() {
-                self.smooth_geometric(0.5);
-            }
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut self.geometric_factor).speed(0.01));
+                if ui.button("Smooth Geometric").clicked() {
+                    self.smooth_geometric(self.geometric_factor);
+                }
+            });
 
             if let Err(e) = self.result.as_ref() {
                 ui.colored_label(Color32::RED, e);
@@ -423,6 +431,65 @@ impl State {
     }
 
     pub fn smooth_geometric(&mut self, factor: f32) {
+        let mut selected = self.mesh.selected().clone();
+
+        if selected.is_empty() {
+            selected = (0..self.model.faces.len()).collect::<Vec<_>>();
+        }
+
+        let selected_vertices = selected
+            .iter()
+            .flat_map(|&f| self.model.faces[f].clone())
+            .collect::<HashSet<_>>();
+
+        let n = selected_vertices.len();
+
+        let vertices = (0..self.model.vertices.len())
+            .filter(|i| selected_vertices.contains(i))
+            .collect();
+
+        let Matrices { g, m_v, v, m } = self.model.differential_coordinates(&selected, &vertices);
+
+        let vertices: Vec<_> = self
+            .model
+            .vertices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                if selected_vertices.contains(&i) {
+                    Some((i, v.0))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let v_x = DVector::from_iterator(vertices.len(), vertices.iter().map(|v| v.1.x));
+        let v_y = DVector::from_iterator(vertices.len(), vertices.iter().map(|v| v.1.y));
+        let v_z = DVector::from_iterator(vertices.len(), vertices.iter().map(|v| v.1.z));
+
+        let mut m_inv = CooMatrix::new(n, n);
+        m.triplet_iter()
+            .for_each(|(i, j, a)| m_inv.push(i, j, 1.0 / a));
+        let m_inv = CscMatrix::from(&m_inv);
+
+        let gl = m_inv * g.transpose() * m_v * g;
+
+        let v_tilde_x = &gl * v_x;
+        let v_tilde_y = &gl * v_y;
+        let v_tilde_z = &gl * v_z;
+
+        let v_tilde: Vec<_> = v_tilde_x
+            .into_iter()
+            .zip(v_tilde_y.into_iter().zip(v_tilde_z.into_iter()))
+            .map(|(x, (y, z))| Vec3::new(*x, *y, *z))
+            .collect();
+
+        vertices.iter().zip(v_tilde.iter()).for_each(|((i, _), v)| {
+            self.model.vertices[*i].0 -= factor * v;
+        });
+
+        self.refresh_mesh = true;
     }
 }
 
@@ -444,6 +511,8 @@ pub fn start(model: super::Model) {
         transformation: Matrix3::identity(),
         result: Ok(()),
         refresh_mesh: false,
+        combinatorial_factor: 0.5,
+        geometric_factor: 0.01,
     };
 
     gui::run(&mut state, display, event_loop)
